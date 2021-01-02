@@ -86,80 +86,92 @@ SPIClass hSpi(HSPI);
 SPIClass vSpi(VSPI);
 Adafruit_ILI9341 tft = Adafruit_ILI9341(&vSpi, TFT_DC, TFT_CS, TFT_RST);
 
-volatile	float fReal[FFTN], fImag[FFTN];
+volatile  float fReal[FFTN], fImag[FFTN];
 volatile  float fftBuff[FFTN];
 float oldFftBuff[FFTN];
 
 // FFT計算本体(特別感謝：FPGAマガジン)
-void calcFFT(volatile float *iW, volatile float *oR, volatile float *oI) {
-	short N = FFTN;
-	short P;
-	short halfN = N / 2;
-	short i, j, k, kp, m, h;
-	float w1, w2, s1, s2, t1, t2;
+inline void calcFFT(volatile float *iW, volatile float *oR, volatile float *oI) {
+    short N = FFTN;
+    short stg;
+    short halfN = N / 2;
+    short i, j, k, kp, m, h;
+    float w1, w2, s1, s2, t1, t2;
 
-	i = N;
-	P = 0;
+    // ステージ数を求める
+    i = N;
+    stg = 0;
+    while (i != 1) {
+        i = i / 2;
+        stg++;
+    }
 
-	while (i != 1) {
-		i = i / 2;
-		P++;
-	}
+    // データ入力
+    for (i = 0; i < N; i += STP) {
+      float x = (float)i / N;
+        // ブラックマン窓を適用
+        // fReal[i] = iW[i] * (0.42 - 0.5 * cos(2 * PI * x) + 0.08 * cos(4 * PI * x));
+        // ナットール窓を適用
+        fReal[i] = iW[i] * (0.355768 - 0.487396 * cos(2 * PI * x) + 0.144232 * cos(4 * PI * x) - 0.012604 * cos(6 * PI * x));
+        fImag[i] = 0;
+    }
 
-	for (i = 0; i < N; i += STP) {
-		fReal[i] = iW[i];
-		fImag[i] = 0;
-	}
+    // ビット逆順ソート
+    j = 0;
+    for (i = 0; i <= N - 2; i += STP) {
+        if (i < j) {
+            t1 = fReal[j];
+            fReal[j] = fReal[i];
+            fReal[i] = t1;
+        }
+        k = halfN;
+        while (k <= j) {
+            j = j - k;
+            k = k / 2;
+        }
+        j += k;
+    }
 
-	j = 0;
-	for (i = 0; i <= N - 2; i += STP) {
-		if (i < j) {
-			t1 = fReal[j];
-			fReal[j] = fReal[i];
-			fReal[i] = t1;
-		}
-		k = halfN;
-		while (k <= j) {
-			j = j - k;
-			k = k / 2;
-		}
-		j += k;
-	}
+    // バタフライ演算
+    for (i = 1; i <= stg; i++) {
+        m = pow(2, i);
+        h = m / 2;
+        for (j = 0; j < h; j++) {
+            float w1in = j * (N / m);
+            float w2in = w1in + halfN;
+                w1 = cos(w1in / (FFTN / (2 * PI)));
+                w2 = sin(w2in / (FFTN / (2 * PI)));
+            for (k = j; k < N; k += m) {
+                kp = k + h;
+                s1 = fReal[kp] * w1 - fImag[kp] * w2;
+                s2 = fReal[kp] * w2 + fImag[kp] * w1;
+                t1 = fReal[k] + s1;
+                fReal[kp] = fReal[k] - s1;
+                fReal[k] = t1;
+                t2 = fImag[k] + s2;
+                fImag[kp] = fImag[k] - s2;
+                fImag[k] = t2;
+            }
+        }
+    }
 
-	for (i = 1; i <= P; i++) {
-		m = pow(2, i);
-		h = m / 2;
-		for (j = 0; j < h; j++) {
-			float w1in = j * (N / m);
-			float w2in = w1in + halfN;
-				w1 = cos(w1in / (FFTN / (2 * PI)));
-				w2 = sin(w2in / (FFTN / (2 * PI)));
-			for (k = j; k < N; k += m) {
-				kp = k + h;
-				s1 = fReal[kp] * w1 - fImag[kp] * w2;
-				s2 = fReal[kp] * w2 + fImag[kp] * w1;
-				t1 = fReal[k] + s1;
-				fReal[kp] = fReal[k] - s1;
-				fReal[k] = t1;
-				t2 = fImag[k] + s2;
-				fImag[kp] = fImag[k] - s2;
-				fImag[k] = t2;
-			}
-		}
-	}
-
-	for (i = 0; i < N; i += STP) {
-		oR[i] = fReal[i];
-	}
+    // 結果を出力用配列に格納
+    for (i = 0; i < N; i += STP) {
+        oR[i] = fReal[i];
+    }
 }
 
 // FFT計算は別コアで
 void fft(void *param) {
   for(;;) {
     fftReady = false;
+    // short -> float 変換
+    for(int i = 0; i < FFTN; i++) {
+      fftBuff[i] = (fftBuff[i] + 0.5) / 32767.5;
+    }
     calcFFT(fftBuff , realSpec, imagSpec);
     fftReady = true;
-    delay(50);
+    delay(25);
   }
 }
 
@@ -201,7 +213,7 @@ void getFileNames(char **playList, File dir) {
     if(!item || gFileCnt >= PLAY_LIST_MAX) {
       break;
     } 
-    
+
     if(item.isDirectory()) {
       // 特定ディレクトリは中に入らないよう除外
       if(strcmp(item.name(), "/System Volume Information") != 0 &&
@@ -210,8 +222,7 @@ void getFileNames(char **playList, File dir) {
       }
     } else {
       playList[gFileCnt] = (char *)malloc(256);
-      strcpy(playList[gFileCnt], item.name());
-      //Serial.printf("%s\r\n", playList[gFileCnt]); 
+      strcpy(playList[gFileCnt], item.name()); 
       gFileCnt++;
     }
   }
@@ -222,6 +233,16 @@ void makePlayList(char **playList) {
   File root = SD.open("/");
   getFileNames(playList, root);
   root.close();
+}
+
+// NTPテスト
+void ntpTest(const char *srv) {
+  configTime(9 * 3600, 0, srv);
+  struct tm timeInfo;
+  getLocalTime(&timeInfo);
+  Serial.printf(" %04d/%02d/%02d %02d:%02d:%02d\n",
+          timeInfo.tm_year + 1900, timeInfo.tm_mon + 1, timeInfo.tm_mday,
+          timeInfo.tm_hour, timeInfo.tm_min, timeInfo.tm_sec);
 }
 
 void setup(void) {
@@ -254,6 +275,9 @@ void setup(void) {
   tft.setRotation(3);
   tft.fillRect(0, 0, 320, 240, ILI9341_BLACK);
 
+  // NTPテスト
+  ntpTest("time.google.com");
+  
   // (撮影用)ウェイト
   delay(5000);
 
@@ -292,7 +316,7 @@ void setup(void) {
     false,
     12000000  // 12.0MHz外部オシレータ使用時の設定値    
   };
-  
+
   i2sRet = i2s_driver_install(I2S_NUM_0, &config, 0, NULL);
   i2s_pin_config_t pinConfig = {
     16, // BCK
@@ -311,7 +335,7 @@ void setup(void) {
 }
 
 float oldSpec[60] = {0};
-unsigned char peaks[60] = {0};
+float peaks[60] = {0};
 unsigned char oldPeaks[60] = {0};
 
 void loop() {
@@ -326,7 +350,7 @@ void loop() {
   static int y = 0;
   static bool first = true;
   static int segment = 0;
-  
+
   // 描画範囲指定
   typedef struct {
     int from;
@@ -364,7 +388,7 @@ void loop() {
           rest -= SD_BUFF_SIZE;
           ++writeBuffNum;
         } while(writeBuffNum < SD_BUFF_NUM);
-          
+
         for(int i = 0; i < SD_BUFF_NUM; i++) {
           buffStatus[i] = BUFF_FULL;
         }
@@ -386,7 +410,9 @@ void loop() {
 
         // 描画
         if(first) {
-          memset(peaks, 240, 60);
+          for(int i = 0; i < 60; i++) {
+            peaks[i] = 240;
+          }
           memset(oldFftBuff, 120, 60);
         }         
         // loop() 1サイクルで全部描画せず区画を分けて描画(速度問題対策)
@@ -398,35 +424,40 @@ void loop() {
           }
 
           int x8 = (x << 3) + 32;
-          tft.drawFastVLine(x8, 120,  oldSpec[x], ILI9341_BLACK);
+          //tft.drawFastVLine(x8,  oldSpec[x],  -80, ILI9341_BLACK);
           tft.drawFastHLine(x8 - 1, oldPeaks[x], 2, ILI9341_BLACK);
 
           int spec;    
-          // バーの長さ補正と制限
-          if(x == 0) {
-            spec = (int)realSpec[x] / (1024 * 16);
-          } else if(x < 3) {
-            spec = (int)realSpec[x] / (1024 * 8);
+          // バーの長さ補正
+          if(x < 2) {
+            spec = realSpec[x + 1] /  1;
+          } else if(x < 8) {
+            spec = realSpec[x + 1] *  9;
           } else {
-            spec = (int)realSpec[x] / (1024 * 1);
+            spec = realSpec[x + 1] * 17;
           }
+          // バーの長さをクリップ
           if(abs(spec) > 160) {
-            spec = 160;
+            spec = 0;
           }
-          y = 240 - (spec >> 1);
+
+          y = 240 - (spec * 1);
 
           // 頂点の押し出し
           if(peaks[x] > y) {
             peaks[x] = y;
           }
 
+          // 痕跡消去
+          tft.drawFastVLine(x8, y, 80 - y, ILI9341_BLACK);
+          // 書き込み
           tft.drawFastVLine(x8, 240, 240 - y, ILI9341_BLUE);
           tft.drawFastHLine(x8 - 1, peaks[x],  2, ILI9341_WHITE);
-          
+
           oldSpec[x] = y;
           oldPeaks[x] = peaks[x];
           if(peaks[x] < 240) {
-            peaks[x] += 1;
+            peaks[x] += 0.5;
           } else {
             peaks[x] = 240;
           }
@@ -441,7 +472,7 @@ void loop() {
           tft.setTextSize(0);
           tft.setTextColor(ILI9341_WHITE);
           tft.printf("%d", rest);
-        }
+        } 
         tft.fillRect(0, 10, 30, 10, ILI9341_BLACK); 
         tft.setCursor(0,10);
         tft.setTextSize(0);
@@ -452,7 +483,6 @@ void loop() {
       } else {
         ;
       }
-
       // 選曲制御
       if(prev == true) {
         prev = false;
@@ -475,5 +505,3 @@ SKIP_FILE:
     ;
   }
 }
-
-
